@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# bench/synthetic N: ../repkgs-synthetic and ../dvpkgs-synthetic, each its package set plus N
+# variants of jq (pkgs/jq/jq-v<i>), every one its own package file and derivation:
+#   repkgs:  variant pkgs.jq { autotools.flags.append = [ "--with-variant=<i>" ]; }
+# A full evaluation then instantiates the set's ~460 derivations plus 2N (each variant has
+# separate tests). Both are git repositories, cloned from the committed state of the originals.
+#   REPKGS, DVPKGS   the originals (default ../repkgs, ../dvpkgs next to dv)
+set -euo pipefail
+n=${1:?N}
+ws=$(cd "$(dirname "$0")/../.." && pwd)
+REPKGS=${REPKGS:-$ws/repkgs}
+DVPKGS=${DVPKGS:-$ws/dvpkgs}
+
+make() {
+  local src=$1 dst=$2 file=$3 template=$4
+  rm -rf "$dst"
+  git clone -q "$src" "$dst"
+  N=$n FILE=$file TEMPLATE=$template DST=$dst perl -e '
+    for my $i (0 .. $ENV{N} - 1) {
+      my $name = sprintf("jq-v%06d", $i);
+      my $dir = "$ENV{DST}/pkgs/jq/$name";
+      mkdir $dir or die "$dir: $!";
+      (my $text = $ENV{TEMPLATE}) =~ s/\@I\@/$i/g;
+      open my $f, ">", "$dir/$ENV{FILE}" or die;
+      print $f $text;
+    }'
+  git -C "$dst" add -A
+  git -C "$dst" -c user.name=bench -c user.email=bench@localhost commit -q --allow-empty -m "$n jq variants"
+}
+
+make "$REPKGS" "$ws/repkgs-synthetic" package.nix '{ variant, pkgs }:
+variant pkgs.jq { autotools.flags.append = [ "--with-variant=@I@" ]; }
+'
+make "$DVPKGS" "$ws/dvpkgs-synthetic" package.star 'def package(c):
+    return c.variant(c.pkgs.jq, {"autotools": {"flags": {"append": ["--with-variant=@I@"]}}})
+'
+# every package, for `dv instantiate all.star -A "pkgs.*"`
+printf 'load("//nix/set.star", "package_set")\n\npkgs = package_set(listed = True)\n' > "$ws/dvpkgs-synthetic/all.star"
+git -C "$ws/dvpkgs-synthetic" add all.star
+git -C "$ws/dvpkgs-synthetic" -c user.name=bench -c user.email=bench@localhost commit -q -m "all.star"
+echo "$ws/repkgs-synthetic, $ws/dvpkgs-synthetic: $n variants"

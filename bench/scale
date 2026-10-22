@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# bench/scale: ../repkgs-synthetic (nix-instantiate) against ../dvpkgs-synthetic (dv), one
+# package (jq) and every package, by .drv path: checked to agree, then timed.
+#   nix          nix-instantiate, read-only: it computes the paths and writes nothing, as dv
+#   dv cold      no cache, one thread / all cores
+#   cold+cache   all cores, an empty cache it fills (what a first run costs)
+#   dv warm      the cache of an identical earlier run
+#   dv edited    every package, after appending a comment to one package file
+# Each cell is the best of RUNS: seconds and peak memory.
+#   DV      dv binary (default: target/release/dv)
+#   STORE   Nix store, which must hold the base set's dynamic-derivation producers (one
+#           read-write instantiation of repkgs does it; default as tools/parity)
+#   RUNS    runs per cell (default 3)
+set -euo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+ws=$(cd "$here/.." && pwd)
+export DV=${DV:-$here/target/release/dv}
+export STORE=${STORE:-local?root=${TMPDIR:-/tmp}/dvpkgs-parity}
+RUNS=${RUNS:-3}
+export work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+export ws
+export NIX_CONFIG='extra-experimental-features = ca-derivations dynamic-derivations nix-command'
+TIME=$(nix --extra-experimental-features 'nix-command flakes' build --no-link --print-out-paths nixpkgs#time)/bin/time
+
+nix_one() {
+  cd "$ws/repkgs-synthetic" && nix-instantiate --store "$STORE" --eval --strict -E \
+    '(import ./. { system = "x86_64-linux"; }).jq.drvPath'
+}
+nix_all() {
+  cd "$ws/repkgs-synthetic" && nix-instantiate --store "$STORE" --eval --strict --json -E '
+    builtins.mapAttrs (n: v: if v.supported or true then v.drvPath else "UNSUPPORTED")
+      (import ./. { system = "x86_64-linux"; })'
+}
+dv_one() { "$DV" "$@" instantiate "$ws/dvpkgs-synthetic/default.star" -A pkgs.jq; }
+dv_all() { "$DV" "$@" instantiate "$ws/dvpkgs-synthetic/all.star" -A 'pkgs.*'; }
+dv_fresh() { rm -rf "$work/cache-fresh"; "$@" --cache "$work/cache-fresh"; }
+dv_edited() {
+  printf '# %s\n' "$RANDOM$RANDOM" >> "$ws/dvpkgs-synthetic/pkgs/jq/jq/package.star"
+  dv_all --cache "$work/cache-all"
+}
+export -f nix_one nix_all dv_one dv_all dv_edited dv_fresh
+
+# "<seconds>s <MB>MB", best of RUNS
+cell() {
+  local best=
+  for _ in $(seq "$RUNS"); do
+    "$TIME" -f '%e %M' -o "$work/t" bash -c '"$@"' _ "$@" > /dev/null 2>> "$work/err"
+    read -r s kb < "$work/t"
+    if [ -z "$best" ] || awk -v a="$s" -v b="${best%%s*}" 'BEGIN { exit !(a < b) }'; then best="${s}s $((kb / 1024))MB"; fi
+  done
+  printf '%16s' "$best"
+}
+
+# the same derivations?
+nix_all | jq -r 'to_entries[] | "pkgs.\(.key)\t\(.value)"' | LC_ALL=C sort > "$work/nix"
+dv_all --no-cache 2> /dev/null | sed 's/\t<poison: .*>$/\tUNSUPPORTED/' | LC_ALL=C sort > "$work/dv"
+n=$(wc -l < "$work/nix")
+if ! diff -q "$work/nix" "$work/dv" > /dev/null; then
+  echo "dv and nix disagree:"
+  diff "$work/nix" "$work/dv" | head
+  exit 1
+fi
+[ "$(nix_one 2> /dev/null | tr -d '"')" = "$(dv_one --no-cache 2> /dev/null)" ] || { echo "jq differs"; exit 1; }
+echo "$n packages, the same .drv paths ($(nproc) cores)"
+
+printf '%-10s%16s%16s%16s%16s%16s%16s\n' "" nix "dv cold -j1" "dv cold" "cold+cache" "dv warm" "dv edited"
+dv_one --cache "$work/cache-one" > /dev/null 2>&1
+printf '%-10s' "jq"
+cell nix_one
+cell dv_one --no-cache -j1
+cell dv_one --no-cache
+cell dv_fresh dv_one
+cell dv_one --cache "$work/cache-one"
+printf '%16s\n' "-"
+dv_all --cache "$work/cache-all" > /dev/null 2>&1
+f=$ws/dvpkgs-synthetic/pkgs/jq/jq/package.star
+cp "$f" "$work/jq.star"
+printf '%-10s' "all"
+cell nix_all
+cell dv_all --no-cache -j1
+cell dv_all --no-cache
+cell dv_fresh dv_all
+cell dv_all --cache "$work/cache-all"
+cell dv_edited
+echo
+cp "$work/jq.star" "$f"
